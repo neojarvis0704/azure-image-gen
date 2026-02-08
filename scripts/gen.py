@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import requests
+import base64
 from openai import AzureOpenAI
 from datetime import datetime
 from pathlib import Path
@@ -80,10 +81,17 @@ try:
             quality="high"
         )
 
-    # ---- Download Image from URL ----
-    image_url = response.data[0].url
-    img_data = requests.get(image_url).content
-    
+    # ---- Get Image Bytes (URL or base64) ----
+    image_item = response.data[0]
+    img_data = None
+
+    if getattr(image_item, "url", None):
+        img_data = requests.get(image_item.url).content
+    elif getattr(image_item, "b64_json", None):
+        img_data = base64.b64decode(image_item.b64_json)
+    else:
+        raise ValueError("Image response missing url and b64_json")
+
     with open(out_path, "wb") as f:
         f.write(img_data)
 
