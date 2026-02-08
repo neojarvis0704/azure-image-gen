@@ -1,12 +1,13 @@
 import os
 import sys
 import json
-import base64
+import requests
 from openai import AzureOpenAI
 from datetime import datetime
 from pathlib import Path
-# ---- Minimal .env loader (no external deps) ----
-def load_env_file(path):
+
+# ---- Environment Configuration ----
+def load_env_azure(path):
     try:
         with open(path, "r") as f:
             for line in f:
@@ -16,80 +17,83 @@ def load_env_file(path):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
     except FileNotFoundError:
-        pass
+        print(json.dumps({"ok": False, "error": f"Env file not found at {path}"}))
+        sys.exit(1)
 
-load_env_file("/home/thomas/.env.azure")
+load_env_azure("/home/thomas/.env.azure")
 
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 DEPLOYMENT = os.getenv("AZURE_OPENAI_IMAGE_DEPLOYMENT")
-API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
 
-if not all([AZURE_ENDPOINT, AZURE_API_KEY, DEPLOYMENT]):
-    raise RuntimeError("Missing required Azure OpenAI environment variables")
+if not all([ENDPOINT, API_KEY, DEPLOYMENT]):
+    print(json.dumps({"ok": False, "error": "Missing required Azure environment variables"}))
+    sys.exit(1)
 
-# ---- CLI parsing ----
-# Usage:
-#   gen.py "<prompt>"                -> generate
-#   gen.py "<prompt>" --image a.png b.png -> edit
-
+# ---- Argument Parsing ----
 args = sys.argv[1:]
-if not args:
-    raise RuntimeError("Usage: gen.py '<prompt>' [--image img1 img2 ...]")
+if not args or "--help" in args:
+    print("Usage: gen.py '<prompt>' [--edit] [--ref path1 path2 ...]")
+    sys.exit(0)
 
 prompt = args[0]
-image_paths = []
-if "--image" in args:
-    idx = args.index("--image")
-    image_paths = args[idx + 1:]
-    if not image_paths:
-        raise RuntimeError("--image provided but no image paths given")
+is_edit_mode = "--edit" in args
+ref_images = []
+if "--ref" in args:
+    try:
+        idx = args.index("--ref") + 1
+        for arg in args[idx:]:
+            if arg.startswith("--"): break
+            ref_images.append(arg)
+    except ValueError: pass
 
-# ---- Output path ----
+# ---- Setup Client ----
+client = AzureOpenAI(api_key=API_KEY, api_version=API_VERSION, azure_endpoint=ENDPOINT)
 out_dir = Path(__file__).parent / "out"
 out_dir.mkdir(parents=True, exist_ok=True)
+out_path = out_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_path = out_dir / f"{timestamp}.png"
-
-# ---- Azure OpenAI Image call via Python SDK ----
-client = AzureOpenAI(
-    api_key=AZURE_API_KEY,
-    api_version=API_VERSION,
-    azure_endpoint=AZURE_ENDPOINT,
-)
-
-if image_paths:
-    # ---- Edit / blend mode ----
-    image_files = [open(p, "rb") for p in image_paths]
-    try:
-        result = client.images.edit(
+try:
+    if is_edit_mode:
+        if not ref_images:
+            raise ValueError("Edit mode requires --ref images")
+        
+        handles = [open(p, "rb") for p in ref_images]
+        try:
+            # Removed response_format to prevent "unrecognized parameter" error
+            response = client.images.edit(
+                model=DEPLOYMENT,
+                prompt=prompt,
+                image=handles,
+                size="1024x1024",
+                quality="high",
+                extra_body={"input_fidelity": "high"}
+            )
+        finally:
+            for h in handles: h.close()
+    else:
+        response = client.images.generate(
             model=DEPLOYMENT,
             prompt=prompt,
-            image=image_files,
             size="1024x1024",
+            quality="high"
         )
-    finally:
-        for f in image_files:
-            f.close()
-else:
-    # ---- Generate mode ----
-    result = client.images.generate(
-        model=DEPLOYMENT,
-        prompt=prompt,
-        size="1024x1024",
-    )
 
-# ---- Decode base64 image ----
-image_base64 = result.data[0].b64_json
-image_bytes = base64.b64decode(image_base64)
+    # ---- Download Image from URL ----
+    image_url = response.data[0].url
+    img_data = requests.get(image_url).content
+    
+    with open(out_path, "wb") as f:
+        f.write(img_data)
 
-with open(out_path, "wb") as f:
-    f.write(image_bytes)
+    print(json.dumps({
+        "ok": True,
+        "mode": "edit" if is_edit_mode else "generate",
+        "path": str(out_path),
+        "prompt": prompt
+    }))
 
-# ---- OpenClaw-friendly stdout ----
-print(json.dumps({
-    "ok": True,
-    "path": str(out_path),
-    "prompt": prompt
-}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e)}))
+    sys.exit(1)
